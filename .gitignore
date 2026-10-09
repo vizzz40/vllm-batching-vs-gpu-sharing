@@ -1,0 +1,15 @@
+# Personal, local-only files: never committed or pushed
+CLAUDE.md
+LEARNING.md
+application/
+
+# Secrets and model weights
+.env
+*.safetensors
+*.bin
+*.gguf
+.cache/
+hf-cache/
+
+# Local tooling
+.claude/
