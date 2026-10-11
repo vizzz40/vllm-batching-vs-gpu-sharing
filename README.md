@@ -1,44 +1,48 @@
-# GPU-efficient LLM serving on Kubernetes
+# LLM serving on one GPU: batching vs sharing, measured
 
-A hands-on lab about using GPUs efficiently when serving LLMs. It serves a small model with vLLM, measures how well it uses the GPU, then shares one GPU between several workloads and measures what the sharing costs in latency.
+How efficiently does an LLM server use a GPU, and what happens when two servers share one? This lab serves a small model with [vLLM](https://github.com/vllm-project/vllm), load-tests it with [k6](https://k6.io), and measures throughput and tail latency in two experiments:
 
-Stack: vLLM, Kubernetes, Argo CD (GitOps), Prometheus + Grafana (vLLM and GPU metrics), k6 (load testing).
+1. **Batching:** one vLLM server, 1 to 64 requests in flight.
+2. **Sharing:** two vLLM servers time-slicing one GPU vs one server, under the same total load.
 
-This is a learning project, not a production system. Every number in this README comes from a real run, and the hardware is listed next to it.
+Stack: vLLM v0.31.0, Docker (WSL2) with the NVIDIA Container Toolkit, k6 v2.2.0. Hardware: NVIDIA RTX 4050 Laptop GPU (6 GB).
 
-## Questions this lab answers
+This is a learning project, not a production system. Every number here comes from a real run on the hardware above; raw k6 outputs are in [loadtest/results/](loadtest/results/).
 
-1. **One model, one GPU:** how much does vLLM's request batching raise throughput, and what does it cost in latency?
-2. **Sharing one GPU:** what happens to throughput and tail latency when two model servers share a GPU (time-slicing), compared with one?
-3. **Cluster level (later):** how do quotas and queueing (Kueue) and scale-to-zero (KEDA) change GPU usage?
+## Key findings
 
-## Hardware
+- **Batching is the main efficiency lever.** Going from 1 to 16 requests in flight raised throughput ~15× (129 → 1,916 tokens/s) while p95 latency stayed at ~1.1 s. At 64 requests, throughput was ~36× (4,716 tokens/s) at 1.8 s p95.
+- **Time-slicing one GPU between two copies of a model wasted about half of it.** Under the same total load, two servers produced 47–53% fewer tokens/s than one server and roughly doubled p95 latency.
+- **For one model, scale the batch before adding copies.** Sharing a GPU makes sense for different, low-traffic models, and then memory limits need to be enforced.
 
-- Laptop: NVIDIA RTX 4050 Laptop GPU, 6 GB (Docker on WSL2)
-- Cloud (planned, not run yet): one AWS GPU node joined to a Kubernetes cluster, tainted so only GPU workloads run on it
+## Setup
 
-## Progress
+```mermaid
+flowchart LR
+    subgraph WSL2["WSL2 (Ubuntu)"]
+        K1["k6<br/>N virtual users"]
+        K2["k6<br/>N virtual users<br/>(sharing test only)"]
+    end
+    subgraph Docker["Docker Desktop"]
+        A["vllm-a :8000<br/>Qwen2.5-0.5B"]
+        B["vllm-b :8001<br/>Qwen2.5-0.5B<br/>(sharing test only)"]
+    end
+    GPU[("RTX 4050 Laptop<br/>6 GB VRAM")]
+    K1 -- "POST /v1/chat/completions" --> A
+    K2 -- "POST /v1/chat/completions" --> B
+    A -- "--gpus all" --> GPU
+    B -- "--gpus all" --> GPU
+```
 
-- [x] Docker can see the laptop GPU (`nvidia-smi` in a CUDA 12.4 container, RTX 4050 6 GB, driver 592.00)
-- [x] vLLM serving a small model in Docker (laptop GPU): Qwen2.5-0.5B-Instruct, vLLM v0.31.0, KV cache 2.46 GiB (~215k tokens)
-- [x] k6 load-test script with a concurrency sweep ([loadtest/sweep.js](loadtest/sweep.js))
-- [x] Baseline: throughput and latency vs concurrency, one vLLM server (laptop)
-- [x] Sharing: two vLLM servers on one GPU vs one (laptop)
-
-Status: layers 1 and 2 are done on the laptop GPU. The Kubernetes and cloud GPU steps below are planned and not started.
-
-- [ ] Local kind cluster with Argo CD, Prometheus and Grafana
-- [ ] vLLM manifests for a tainted GPU node
-- [ ] Cloud GPU node joined, tainted, GPU visible to Kubernetes
-- [ ] vLLM deployed to the GPU node by Argo CD
-- [ ] Grafana dashboard with vLLM and GPU metrics
-- [ ] Baseline and sharing experiments repeated on the cloud GPU
+- **Load:** each k6 virtual user (VU) sends one chat request, waits for the full answer, then sends the next, for 60 s ([loadtest/sweep.js](loadtest/sweep.js)). So VUs = requests in flight.
+- **Same work per request:** every request generates exactly 128 tokens (`max_tokens: 128`, `ignore_eos: true`), and a random prefix in each prompt avoids cache hits between requests.
+- **Metrics:** throughput = generated tokens per second summed over all users. Latency = full request time (k6 `http_req_duration`), from sending the request to receiving the last token.
 
 ## Results
 
-### 1. Batching: throughput vs latency, one vLLM server (laptop)
+### 1. Batching: throughput vs latency, one vLLM server
 
-Setup: vLLM v0.31.0 in Docker, Qwen2.5-0.5B-Instruct (bf16), `--gpu-memory-utilization 0.7`, `--max-model-len 4096`, RTX 4050 Laptop 6 GB. k6 v2.2.0 runs N virtual users (VUs) for 60 s each. Each VU sends one chat request, waits for the full answer, then sends the next. Every request generates exactly 128 tokens (`ignore_eos: true`), so all runs do the same work per request.
+Server: `--gpu-memory-utilization 0.7`, `--max-model-len 4096` (KV cache 2.46 GiB, ~215k tokens).
 
 | VUs (requests in flight) | Throughput (tokens/s) | Requests in 60 s | p50 latency | p95 latency | Failed |
 |---:|---:|---:|---:|---:|---:|
@@ -50,16 +54,14 @@ Setup: vLLM v0.31.0 in Docker, Qwen2.5-0.5B-Instruct (bf16), `--gpu-memory-utili
 | 32 | 3,157 | 1,505 | 1.27 s | 1.32 s | 0 |
 | 64 | 4,716 | 2,240 | 1.73 s | 1.79 s | 0 |
 
-Throughput is generated tokens per second summed over all users. Latency is the full request time (k6 `http_req_duration`), from sending the request to receiving the last token.
-
 What it shows:
 - **Up to 16 users, batching is almost free.** Throughput grows ~15× while p95 latency rises by only 0.03 s. vLLM runs all in-flight requests in the same GPU step, and each step costs about the same whether it serves 1 request or 16.
 - **Past 16 users, latency starts to pay.** At 64 users throughput is ~36× the single-user value, but each request takes 1.73 s instead of 0.98 s (~13.5 ms per token instead of ~7.7 ms). Each user gets slower tokens; the GPU produces many more in total.
 - **The operating point depends on the latency target.** If the target is p95 < 1.1 s, this server should run at about 16 concurrent requests. If the target is p95 < 2 s, 64 requests give ~2.5× more throughput.
 
-### 2. Sharing: two vLLM servers on one GPU vs one (laptop)
+### 2. Sharing: two vLLM servers on one GPU vs one
 
-Setup: same model, script and GPU as above, but every server gets `--gpu-memory-utilization 0.35` (~2.1 GB, KV cache 31,424 tokens), so the only difference between runs is sharing. Two servers run as two containers on the same GPU (ports 8000 and 8001), and two k6 runs load them at the same time. With no sharing tool installed, the GPU time-slices between the two processes: it runs one, then switches to the other.
+Every server gets `--gpu-memory-utilization 0.35` (~2.1 GB, KV cache 31,424 tokens), so the only difference between runs is sharing. Two servers run as two containers on the same GPU, and two k6 runs load them at the same time. With no sharing tool installed, the GPU time-slices between the two processes: it runs one, then switches to the other.
 
 Same total load, one server vs two:
 
@@ -75,11 +77,45 @@ For two servers, latency is the worse of the two servers. Sanity check: the 0.35
 What it shows:
 - **Sharing cost about half the throughput.** With the same users, two servers produced 47–53% fewer tokens/s than one server and roughly doubled p95 latency.
 - **Two servers together made less than one server serving only half the users.** 16 + 16 users on two servers gave 1,471 tokens/s; one server with 16 users gave 1,890 tokens/s.
-- **Why (likely, not yet profiled):** the two servers cannot batch together. Each one batches only its own users, and the GPU switches between the two processes instead of running one bigger batch. For a small model whose GPU steps are short, the switching and idle gaps take a large share of the time.
-- **Takeaway:** time-slicing gives two workloads access to one GPU, but not more capacity. For one model, one server with a bigger batch is far more efficient than several copies. Sharing makes sense for different models with low traffic, and then memory limits must be enforced (HAMi, MIG), because nothing stops one server from taking the other's memory.
+- **Where the loss comes from (estimate, not profiled):** if switching between the two processes were free, each server would get half the GPU and the pair would match one server with 16 users (~1,890 tokens/s). That part, ~40% below one server with 32 users, is lost batching: the two servers cannot batch together. The remaining gap down to 1,471 tokens/s (~22% below that ideal) is switching overhead and idle gaps.
+- **Takeaway:** time-slicing gives two workloads access to one GPU, but not more capacity. Sharing makes sense for different models with low traffic, and then memory limits must be enforced (for example with HAMi or MIG), because `--gpu-memory-utilization` is a setting each server follows, not a limit the GPU enforces.
 
-Raw k6 summaries: [loadtest/results/](loadtest/results/) (`laptop-*` = batching sweep, `share-*` = sharing test). Reproduce one point (vLLM running on port 8000):
+## Reproduce
+
+Requirements: an NVIDIA GPU visible to Docker (`docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi` works) and k6.
 
 ```bash
-k6 run -e VUS=16 -e DURATION=60s --summary-export loadtest/results/laptop-vus16.json loadtest/sweep.js
+# Server A (for the batching sweep, use --gpu-memory-utilization 0.7)
+docker run -d --name vllm-a --gpus all -p 8000:8000 --ipc=host \
+  -v hf-cache:/root/.cache/huggingface vllm/vllm-openai:v0.31.0 \
+  Qwen/Qwen2.5-0.5B-Instruct --gpu-memory-utilization 0.35 --max-model-len 4096
+
+# One load point: 16 VUs for 60 s
+k6 run -e VUS=16 --summary-trend-stats "med,p(95),p(99)" \
+  --summary-export loadtest/results/share-single-vus16.json loadtest/sweep.js
+
+# Sharing test: start server B after A is healthy (curl localhost:8000/health),
+# then load both at the same time
+docker run -d --name vllm-b --gpus all -p 8001:8000 --ipc=host \
+  -v hf-cache:/root/.cache/huggingface vllm/vllm-openai:v0.31.0 \
+  Qwen/Qwen2.5-0.5B-Instruct --gpu-memory-utilization 0.35 --max-model-len 4096
+k6 run -e VUS=16 -e URL=http://localhost:8000/v1/chat/completions \
+  --summary-export loadtest/results/share-pair-a-vus16.json loadtest/sweep.js &
+k6 run -e VUS=16 -e URL=http://localhost:8001/v1/chat/completions \
+  --summary-export loadtest/results/share-pair-b-vus16.json loadtest/sweep.js &
+wait
+
+docker stop vllm-a vllm-b
 ```
+
+## Limitations
+
+- **One small model on one laptop GPU.** Absolute numbers are specific to a 0.5B model on an RTX 4050 Laptop under WSL2. The direction of the results (batching helps until latency bends; time-slicing copies of one model loses capacity) is expected to hold elsewhere. The size of the switching overhead may differ on a datacenter GPU under native Linux and with larger models, where each GPU step is longer.
+- **Short, fixed requests.** Every request has a short prompt and exactly 128 output tokens. Real traffic with long prompts and varied lengths fills the KV cache much faster.
+- **Not profiled.** The split of the sharing loss into lost batching and switching overhead is an estimate from the numbers above, not from a GPU profiler.
+
+## Possible next steps
+
+- Prometheus and Grafana on vLLM's `/metrics` during the runs, to show KV cache usage and queued requests behind the latency curve.
+- Enforced sharing (HAMi, or MIG on a GPU that supports it) compared with plain time-slicing.
+- The same experiments on a datacenter GPU under native Linux, deployed on Kubernetes.
