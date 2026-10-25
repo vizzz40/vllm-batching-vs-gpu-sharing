@@ -108,6 +108,20 @@ wait
 docker stop vllm-a vllm-b
 ```
 
+## Watch a run live (Prometheus + Grafana)
+
+vLLM exposes its internal state at `/metrics`: requests running and waiting, KV cache usage, time to first token and time between tokens. [monitoring/](monitoring/) runs Prometheus, which scrapes that page every 5 s, and Grafana, which is already connected to it.
+
+```bash
+docker compose -f monitoring/docker-compose.yml up -d   # vLLM must be running on :8000
+loadtest/run-sweep.sh knee 64 128 256                   # load it while watching the graphs
+python loadtest/summarize.py loadtest/results/knee-vus*.json
+docker compose -f monitoring/docker-compose.yml down    # recorded data stays in a Docker volume
+```
+
+- Prometheus: http://localhost:9090/targets (the `vllm` target should be UP)
+- Grafana: http://localhost:3000 (no login; both ports are bound to localhost only)
+
 ## Limitations
 
 - **One small model on one laptop GPU.** Absolute numbers are specific to a 0.5B model on an RTX 4050 Laptop under WSL2. The direction of the results (batching helps until latency bends; time-slicing copies of one model loses capacity) is expected to hold elsewhere. The size of the switching overhead may differ on a datacenter GPU under native Linux and with larger models, where each GPU step is longer.
