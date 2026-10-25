@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 5s # default is 1m; each k6 load level lasts only 60 s
+
+scrape_configs:
+  - job_name: vllm
+    static_configs:
+      - targets: ["host.docker.internal:8000"] # vLLM's /metrics (metrics_path defaults to /metrics)

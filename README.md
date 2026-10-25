@@ -35,7 +35,7 @@ flowchart LR
 ```
 
 - **Load:** each k6 virtual user (VU) sends one chat request, waits for the full answer, then sends the next, for 60 s ([loadtest/sweep.js](loadtest/sweep.js)). So VUs = requests in flight.
-- **Same work per request:** every request generates exactly 128 tokens (`max_tokens: 128`, `ignore_eos: true`), and a random prefix in each prompt avoids cache hits between requests.
+- **Same work per request:** every request generates exactly 128 tokens (`max_tokens: 128`, `ignore_eos: true`), and a random number at the start of each user message keeps the prompts different. Prompts are short (~40 tokens), so nearly all the work is generating tokens.
 - **Metrics:** throughput = generated tokens per second summed over all users. Latency = full request time (k6 `http_req_duration`), from sending the request to receiving the last token.
 
 ## Results
@@ -112,6 +112,7 @@ docker stop vllm-a vllm-b
 
 - **One small model on one laptop GPU.** Absolute numbers are specific to a 0.5B model on an RTX 4050 Laptop under WSL2. The direction of the results (batching helps until latency bends; time-slicing copies of one model loses capacity) is expected to hold elsewhere. The size of the switching overhead may differ on a datacenter GPU under native Linux and with larger models, where each GPU step is longer.
 - **Short, fixed requests.** Every request has a short prompt and exactly 128 output tokens. Real traffic with long prompts and varied lengths fills the KV cache much faster.
+- **Some prompt caching remained.** Qwen's chat template puts the same default system prompt in front of every user message, so vLLM's prefix cache still matched that shared part (the vLLM log showed a ~29% prefix-cache hit rate during the batching sweep). With ~40-token prompts and 128-token answers, this barely changes the results. It also matches real chat traffic, where requests share a system prompt.
 - **Not profiled.** The split of the sharing loss into lost batching and switching overhead is an estimate from the numbers above, not from a GPU profiler.
 
 ## Possible next steps

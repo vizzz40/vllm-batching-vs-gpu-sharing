@@ -1,0 +1,8 @@
+# Grafana reads this at startup, so Prometheus is connected without clicking through the UI.
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: prometheus # fixed ID, so an exported dashboard JSON points at this data source
+    type: prometheus
+    url: http://prometheus:9090 # Compose service name; containers in one Compose project share a network
+    isDefault: true
